@@ -281,6 +281,58 @@ struct NotchPreviewContent: View {
     }
 }
 
+// MARK: - Shortcut Recorder
+
+struct ShortcutRecorderView: View {
+    @Binding var shortcut: AppToggleShortcut
+    @State private var isRecording = false
+    @State private var keyMonitor: Any?
+
+    var body: some View {
+        Button {
+            startRecording()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: isRecording ? "record.circle" : "keyboard")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(isRecording ? "Press shortcut" : shortcut.label)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .frame(minWidth: 132)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(isRecording ? Color.red.opacity(0.12) : Color.primary.opacity(0.08))
+            )
+        }
+        .buttonStyle(.plain)
+        .onDisappear {
+            stopRecording()
+        }
+    }
+
+    private func startRecording() {
+        stopRecording()
+        isRecording = true
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if let newShortcut = AppToggleShortcut.from(event: event) {
+                shortcut = newShortcut
+            }
+            stopRecording()
+            return nil
+        }
+    }
+
+    private func stopRecording() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+        }
+        keyMonitor = nil
+        isRecording = false
+    }
+}
+
 // MARK: - Settings Tabs
 
 enum SettingsTab: String, CaseIterable, Identifiable {
@@ -914,10 +966,10 @@ struct SettingsView: View {
                     )
 
                     HStack(spacing: 6) {
-                        Image(systemName: "escape")
+                        Image(systemName: "keyboard")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.secondary)
-                        Text("Press Esc to stop the teleprompter.")
+                        Text("Press \(settings.stopShortcut.label) to stop the teleprompter.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     }
@@ -942,6 +994,36 @@ struct SettingsView: View {
                     }
                 }
                 .toggleStyle(.checkbox)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Stop Shortcut")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Choose the key that hides the active teleprompter.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: $settings.stopShortcut) {
+                        ForEach(StopShortcut.allCases) { shortcut in
+                            Text(shortcut.label).tag(shortcut)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 96)
+                }
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Script Window Shortcut")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("After pressing Play, use it to hide or show the script window.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    ShortcutRecorderView(shortcut: $settings.appToggleShortcut)
+                }
 
                 Toggle(isOn: $settings.hideFromScreenShare) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -1398,6 +1480,8 @@ struct SettingsView: View {
         settings.listeningMode = .wordTracking
         settings.scrollSpeed = 3
         settings.showElapsedTime = true
+        settings.stopShortcut = .escape
+        settings.appToggleShortcut = .defaultShortcut
         settings.selectedMicUID = ""
         settings.autoNextPage = false
         settings.autoNextPageDelay = 3

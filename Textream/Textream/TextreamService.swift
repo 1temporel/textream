@@ -161,6 +161,12 @@ class TextreamService: NSObject, ObservableObject {
         }
     }
 
+    func togglePrompterVisibility() -> Bool {
+        guard overlayController.isShowing else { return false }
+        overlayController.toggleVisibility()
+        return true
+    }
+
     @Published var currentFileURL: URL?
     @Published var savedPages: [String] = [""]
 

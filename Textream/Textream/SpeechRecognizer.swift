@@ -101,6 +101,10 @@ class SpeechRecognizer {
     private var pendingRestart: DispatchWorkItem?
     private var sessionGeneration: Int = 0
     private var suppressConfigChange: Bool = false
+    private var recognitionWatchdog: Timer?
+    private var lastResultAt: Date = .distantPast
+    private var lastProgressAt: Date = .distantPast
+    private var lastWatchdogRestartAt: Date = .distantPast
 
     /// Update the source text while preserving the current recognized char count.
     /// Used by Director Mode to live-edit unread text without resetting read progress.
@@ -135,6 +139,9 @@ class SpeechRecognizer {
         recognizedCharCount = 0
         matchStartOffset = 0
         retryCount = 0
+        lastResultAt = Date()
+        lastProgressAt = Date()
+        lastWatchdogRestartAt = .distantPast
         error = nil
         sessionGeneration += 1
 
@@ -213,6 +220,8 @@ class SpeechRecognizer {
         // Cancel any pending restart to prevent overlapping beginRecognition calls
         pendingRestart?.cancel()
         pendingRestart = nil
+        recognitionWatchdog?.invalidate()
+        recognitionWatchdog = nil
 
         if let observer = configurationChangeObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -355,6 +364,9 @@ class SpeechRecognizer {
                     // Ignore stale results from a previous session
                     guard self.sessionGeneration == currentGeneration else { return }
                     self.retryCount = 0 // Reset on success
+                    if spoken != self.lastSpokenText {
+                        self.lastResultAt = Date()
+                    }
                     self.lastSpokenText = spoken
                     self.matchCharacters(spoken: spoken)
                 }
@@ -365,6 +377,8 @@ class SpeechRecognizer {
                     guard self.recognitionRequest != nil else { return }
                     if self.isListening && !self.shouldDismiss && !self.sourceText.isEmpty && self.retryCount < self.maxRetries {
                         self.retryCount += 1
+                        self.matchStartOffset = min(self.recognizedCharCount, self.sourceText.count)
+                        self.sessionGeneration += 1
                         let delay = min(Double(self.retryCount) * 0.5, 1.5)
                         self.scheduleBeginRecognition(after: delay)
                     } else {
@@ -378,6 +392,9 @@ class SpeechRecognizer {
             audioEngine.prepare()
             try audioEngine.start()
             isListening = true
+            lastResultAt = Date()
+            lastProgressAt = Date()
+            startRecognitionWatchdog()
         } catch {
             // Transient failure after a device switch — retry with longer delay
             if retryCount < maxRetries {
@@ -393,98 +410,50 @@ class SpeechRecognizer {
     private func restartRecognition() {
         // Reset retries so the fresh engine gets a full set of attempts
         retryCount = 0
+        matchStartOffset = min(recognizedCharCount, sourceText.count)
+        sessionGeneration += 1
         isListening = true
         // Longer delay to let the audio system fully settle after a device change
         cleanupRecognition()
         scheduleBeginRecognition(after: 0.5)
     }
 
-    // MARK: - Fuzzy character-level matching
+    private func startRecognitionWatchdog() {
+        recognitionWatchdog?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.checkRecognitionHealth()
+            }
+        }
+        recognitionWatchdog = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
 
-    private func matchCharacters(spoken: String) {
-        // Strategy 1: character-level fuzzy match from the start offset
-        let charResult = charLevelMatch(spoken: spoken)
+    private func checkRecognitionHealth() {
+        guard isListening,
+              recognitionRequest != nil,
+              !sourceText.isEmpty,
+              !shouldDismiss else { return }
 
-        // Strategy 2: word-level match (handles STT word substitutions)
-        let wordResult = wordLevelMatch(spoken: spoken)
+        let now = Date()
+        guard now.timeIntervalSince(lastWatchdogRestartAt) > Self.watchdogRestartCooldown else {
+            return
+        }
 
-        let best = max(charResult, wordResult)
-
-        // Only move forward from the match start offset
-        let newCount = matchStartOffset + best
-        if newCount > recognizedCharCount {
-            recognizedCharCount = min(newCount, sourceText.count)
+        if isSpeaking && now.timeIntervalSince(lastResultAt) > Self.recognitionResultStallInterval {
+            lastWatchdogRestartAt = now
+            restartRecognition()
         }
     }
 
-    private func charLevelMatch(spoken: String) -> Int {
-        let remainingSource = String(sourceText.dropFirst(matchStartOffset))
-        let src = Array(remainingSource.lowercased().unicodeScalars).map { Character($0) }
-        let spk = Array(Self.normalize(spoken).unicodeScalars).map { Character($0) }
+    // MARK: - Script matching
 
-        var si = 0
-        var ri = 0
-        var lastGoodOrigIndex = 0
-
-        while si < src.count && ri < spk.count {
-            let sc = src[si]
-            let rc = spk[ri]
-
-            // Skip non-alphanumeric in source
-            if !sc.isLetter && !sc.isNumber {
-                si += 1
-                continue
-            }
-            // Skip non-alphanumeric in spoken
-            if !rc.isLetter && !rc.isNumber {
-                ri += 1
-                continue
-            }
-
-            if sc == rc {
-                si += 1
-                ri += 1
-                lastGoodOrigIndex = si
-            } else {
-                // Try to re-sync: look ahead in both strings
-                var found = false
-
-                // Skip up to 3 chars in spoken (STT inserted extra chars)
-                let maxSkipR = min(3, spk.count - ri - 1)
-                if maxSkipR >= 1 {
-                    for skipR in 1...maxSkipR {
-                        let nextRI = ri + skipR
-                        if nextRI < spk.count && spk[nextRI] == sc {
-                            ri = nextRI
-                            found = true
-                            break
-                        }
-                    }
-                }
-                if found { continue }
-
-                // Skip up to 3 chars in source (STT missed some chars)
-                let maxSkipS = min(3, src.count - si - 1)
-                if maxSkipS >= 1 {
-                    for skipS in 1...maxSkipS {
-                        let nextSI = si + skipS
-                        if nextSI < src.count && src[nextSI] == rc {
-                            si = nextSI
-                            found = true
-                            break
-                        }
-                    }
-                }
-                if found { continue }
-
-                // Skip both (substitution)
-                si += 1
-                ri += 1
-                lastGoodOrigIndex = si
-            }
+    private func matchCharacters(spoken: String) {
+        let newCount = strictWordLevelAdvance(spoken: spoken)
+        if newCount > recognizedCharCount {
+            recognizedCharCount = min(newCount, sourceText.count)
+            lastProgressAt = Date()
         }
-
-        return lastGoodOrigIndex
     }
 
     private static func isAnnotationWord(_ word: String) -> Bool {
@@ -493,110 +462,410 @@ class SpeechRecognizer {
         return stripped.isEmpty
     }
 
-    private func wordLevelMatch(spoken: String) -> Int {
-        let remainingSource = String(sourceText.dropFirst(matchStartOffset))
-        let sourceWords = remainingSource.split(separator: " ").map { String($0) }
-        let spokenWords = spoken.lowercased().split(separator: " ").map { String($0) }
+    private struct SourceToken {
+        let value: String
+        let advanceOffset: Int
+    }
 
-        var si = 0 // source word index
-        var ri = 0 // spoken word index
-        var matchedCharCount = 0
+    private struct PrefixMatch {
+        let sourceIndex: Int
+        let spokenIndex: Int
+        let matchedCount: Int
+        let advanceOffset: Int
+        let lastMatchedToken: SourceToken?
+    }
 
-        while si < sourceWords.count && ri < spokenWords.count {
-            // Auto-skip annotation words in source (brackets, emoji)
-            if Self.isAnnotationWord(sourceWords[si]) {
-                matchedCharCount += sourceWords[si].count
-                if si < sourceWords.count - 1 { matchedCharCount += 1 }
-                si += 1
+    private struct ResyncAnchor {
+        let advanceOffset: Int
+    }
+
+    private struct ResyncCandidate {
+        let sourceIndex: Int
+        let sourceTokens: [SourceToken]
+        let advanceOffset: Int
+    }
+
+    private static let fillerTokens: Set<String> = [
+        "euh", "heu", "hum", "hmm", "mm", "ben", "bah"
+    ]
+
+    private static let localResyncBands = [8, 20, 32]
+    private static let maxDistantResyncLookahead = 180
+    private static let minDistantResyncTailTokens = 7
+    private static let maxResyncTailTokens = 10
+    private static let recognitionResultStallInterval: TimeInterval = 5
+    private static let watchdogRestartCooldown: TimeInterval = 6
+
+    private func strictWordLevelAdvance(spoken: String) -> Int {
+        let allSourceTokens = Self.sourceTokens(in: sourceText)
+        let spokenTokens = Self.tokenValues(in: spoken)
+            .filter { !Self.fillerTokens.contains($0) }
+
+        guard !allSourceTokens.isEmpty else {
+            return sourceText.count
+        }
+        guard !spokenTokens.isEmpty else { return recognizedCharCount }
+
+        let sessionAdvance = Self.matchAdvance(
+            sourceTokens: allSourceTokens,
+            sourceStartOffset: matchStartOffset,
+            spokenTokens: spokenTokens,
+            allowPrefixMatch: true,
+            allowResync: false
+        )
+
+        let recoveryAdvance = Self.matchAdvance(
+            sourceTokens: allSourceTokens,
+            sourceStartOffset: recognizedCharCount,
+            spokenTokens: spokenTokens,
+            allowPrefixMatch: false,
+            allowResync: true
+        )
+
+        return max(recognizedCharCount, sessionAdvance, recoveryAdvance)
+    }
+
+    private static func matchAdvance(
+        sourceTokens allSourceTokens: [SourceToken],
+        sourceStartOffset: Int,
+        spokenTokens: [String],
+        allowPrefixMatch: Bool,
+        allowResync: Bool
+    ) -> Int {
+        let sourceTokens = allSourceTokens.filter { $0.advanceOffset > sourceStartOffset }
+
+        guard !sourceTokens.isEmpty else {
+            return sourceStartOffset
+        }
+
+        let prefix = allowPrefixMatch
+            ? prefixMatch(sourceTokens: sourceTokens, spokenTokens: spokenTokens)
+            : PrefixMatch(
+                sourceIndex: 0,
+                spokenIndex: 0,
+                matchedCount: 0,
+                advanceOffset: sourceStartOffset,
+                lastMatchedToken: nil
+            )
+
+        var bestAdvanceOffset = sourceStartOffset
+
+        if let lastMatchedToken = prefix.lastMatchedToken,
+           Self.shouldCommitMatch(
+               matchedCount: prefix.matchedCount,
+               lastMatchedToken: lastMatchedToken,
+               reachedEnd: prefix.sourceIndex >= sourceTokens.count
+           ) {
+            bestAdvanceOffset = max(bestAdvanceOffset, prefix.advanceOffset)
+        }
+
+        if allowResync,
+           prefix.sourceIndex < sourceTokens.count,
+           prefix.spokenIndex < spokenTokens.count,
+           let anchor = Self.findResyncAnchor(
+               sourceTokens: sourceTokens,
+               sourceStartIndex: prefix.sourceIndex,
+               spokenTokens: spokenTokens,
+               spokenStartIndex: prefix.spokenIndex
+           ) {
+            bestAdvanceOffset = max(bestAdvanceOffset, anchor.advanceOffset)
+        }
+
+        return bestAdvanceOffset
+    }
+
+    private static func prefixMatch(sourceTokens: [SourceToken], spokenTokens: [String]) -> PrefixMatch {
+        var sourceIndex = 0
+        var spokenIndex = 0
+        var matchedTokenCount = 0
+        var lastAdvanceOffset = 0
+        var lastMatchedToken: SourceToken?
+
+        while sourceIndex < sourceTokens.count && spokenIndex < spokenTokens.count {
+            let sourceToken = sourceTokens[sourceIndex]
+            let spokenToken = spokenTokens[spokenIndex]
+
+            if Self.isStrictMatch(sourceToken.value, spokenToken) {
+                matchedTokenCount += 1
+                lastAdvanceOffset = sourceToken.advanceOffset
+                lastMatchedToken = sourceToken
+                sourceIndex += 1
+                spokenIndex += 1
+            } else {
+                break
+            }
+        }
+
+        return PrefixMatch(
+            sourceIndex: sourceIndex,
+            spokenIndex: spokenIndex,
+            matchedCount: matchedTokenCount,
+            advanceOffset: lastAdvanceOffset,
+            lastMatchedToken: lastMatchedToken
+        )
+    }
+
+    private static func shouldCommitMatch(
+        matchedCount: Int,
+        lastMatchedToken: SourceToken,
+        reachedEnd: Bool
+    ) -> Bool {
+        let distinctiveSingleWord = lastMatchedToken.value.count >= 5
+
+        // Avoid committing progress on a single short French word such as
+        // "je", "de", "le", or "un"; these are too common and cause false starts
+        // when the speaker goes off-script.
+        guard matchedCount >= 2 || distinctiveSingleWord || reachedEnd else {
+            return false
+        }
+
+        return true
+    }
+
+    private static func findResyncAnchor(
+        sourceTokens: [SourceToken],
+        sourceStartIndex: Int,
+        spokenTokens: [String],
+        spokenStartIndex: Int
+    ) -> ResyncAnchor? {
+        let availableSpokenTokens = spokenTokens.count - spokenStartIndex
+        guard availableSpokenTokens >= 2 else { return nil }
+
+        let maxTailLength = min(maxResyncTailTokens, availableSpokenTokens)
+
+        for bandSize in localResyncBands {
+            let bandEnd = min(sourceTokens.count, sourceStartIndex + bandSize)
+            guard sourceStartIndex < bandEnd else { continue }
+
+            for tailLength in stride(from: maxTailLength, through: 2, by: -1) {
+                let tailStart = spokenTokens.count - tailLength
+                guard tailStart >= spokenStartIndex else { continue }
+
+                let spokenTail = Array(spokenTokens[tailStart..<spokenTokens.count])
+                let candidates = resyncCandidates(
+                    sourceTokens: sourceTokens,
+                    sourceRange: sourceStartIndex..<bandEnd,
+                    spokenTail: spokenTail
+                )
+
+                if let candidate = candidates.first(where: {
+                    isStrongLocalResyncAnchor(
+                        sourceTokens: $0.sourceTokens,
+                        spokenTokens: spokenTail,
+                        skippedTokens: $0.sourceIndex - sourceStartIndex
+                    )
+                }) {
+                    return ResyncAnchor(advanceOffset: candidate.advanceOffset)
+                }
+            }
+        }
+
+        for tailLength in stride(from: maxTailLength, through: minDistantResyncTailTokens, by: -1) {
+            let tailStart = spokenTokens.count - tailLength
+            guard tailStart >= spokenStartIndex else { continue }
+
+            let spokenTail = Array(spokenTokens[tailStart..<spokenTokens.count])
+            let distantEnd = min(sourceTokens.count, sourceStartIndex + maxDistantResyncLookahead)
+            let candidates = resyncCandidates(
+                sourceTokens: sourceTokens,
+                sourceRange: sourceStartIndex..<distantEnd,
+                spokenTail: spokenTail
+            ).filter {
+                isVeryStrongDistantResyncAnchor(sourceTokens: $0.sourceTokens, spokenTokens: spokenTail)
+            }
+
+            if candidates.count == 1, let candidate = candidates.first {
+                return ResyncAnchor(advanceOffset: candidate.advanceOffset)
+            }
+        }
+
+        return nil
+    }
+
+    private static func resyncCandidates(
+        sourceTokens: [SourceToken],
+        sourceRange: Range<Int>,
+        spokenTail: [String]
+    ) -> [ResyncCandidate] {
+        guard !spokenTail.isEmpty, sourceRange.lowerBound < sourceRange.upperBound else {
+            return []
+        }
+
+        var candidates: [ResyncCandidate] = []
+        let searchEnd = min(sourceRange.upperBound, sourceTokens.count)
+        guard sourceRange.lowerBound < searchEnd else { return [] }
+
+        for sourceIndex in sourceRange.lowerBound..<searchEnd {
+            let sourceEndIndex = sourceIndex + spokenTail.count
+            guard sourceEndIndex <= sourceTokens.count else { continue }
+
+            let sourceSlice = Array(sourceTokens[sourceIndex..<sourceEndIndex])
+            guard zip(sourceSlice, spokenTail).allSatisfy({ sourceToken, spokenToken in
+                isStrictMatch(sourceToken.value, spokenToken)
+            }) else {
                 continue
             }
 
-            let srcWord = sourceWords[si].lowercased()
-                .filter { $0.isLetter || $0.isNumber }
-            let spkWord = spokenWords[ri]
-                .filter { $0.isLetter || $0.isNumber }
+            candidates.append(ResyncCandidate(
+                sourceIndex: sourceIndex,
+                sourceTokens: sourceSlice,
+                advanceOffset: sourceSlice[sourceSlice.count - 1].advanceOffset
+            ))
+        }
 
-            if srcWord == spkWord || isFuzzyMatch(srcWord, spkWord) {
-                // Count original chars including trailing punctuation, plus space
-                matchedCharCount += sourceWords[si].count
-                if si < sourceWords.count - 1 {
-                    matchedCharCount += 1 // space
-                }
-                si += 1
-                ri += 1
-            } else {
-                // Try skipping up to 3 spoken words (STT hallucinated words)
-                var foundSpk = false
-                let maxSpkSkip = min(3, spokenWords.count - ri - 1)
-                for skip in 1...max(1, maxSpkSkip) where skip <= maxSpkSkip {
-                    let nextSpk = spokenWords[ri + skip].filter { $0.isLetter || $0.isNumber }
-                    if srcWord == nextSpk || isFuzzyMatch(srcWord, nextSpk) {
-                        ri += skip
-                        foundSpk = true
-                        break
-                    }
-                }
-                if foundSpk { continue }
+        return candidates
+    }
 
-                // Try skipping up to 3 source words (user read fast, STT missed words)
-                var foundSrc = false
-                let maxSrcSkip = min(3, sourceWords.count - si - 1)
-                for skip in 1...max(1, maxSrcSkip) where skip <= maxSrcSkip {
-                    let nextSrc = sourceWords[si + skip].lowercased().filter { $0.isLetter || $0.isNumber }
-                    if nextSrc == spkWord || isFuzzyMatch(nextSrc, spkWord) {
-                        // Add all skipped source words' char counts
-                        for s in 0..<skip {
-                            matchedCharCount += sourceWords[si + s].count + 1
-                        }
-                        si += skip
-                        foundSrc = true
-                        break
-                    }
-                }
-                if foundSrc { continue }
+    private static func isStrongLocalResyncAnchor(
+        sourceTokens: [SourceToken],
+        spokenTokens: [String],
+        skippedTokens: Int
+    ) -> Bool {
+        let stats = resyncStats(sourceTokens: sourceTokens, spokenTokens: spokenTokens)
 
-                // Try treating current source word as punctuation-only and skip it
-                if srcWord.isEmpty {
-                    matchedCharCount += sourceWords[si].count
-                    if si < sourceWords.count - 1 { matchedCharCount += 1 }
-                    si += 1
-                    continue
-                }
-                // No match, advance spoken
-                ri += 1
+        if skippedTokens <= 8 {
+            return isStrongResyncAnchor(sourceTokens: sourceTokens, spokenTokens: spokenTokens)
+        }
+
+        if skippedTokens <= 20 {
+            return stats.matchCount >= 4 && stats.exactCount >= 2 && stats.distinctiveCount >= 1
+        }
+
+        return stats.matchCount >= 5 && stats.exactCount >= 3 && stats.distinctiveCount >= 2
+    }
+
+    private static func isVeryStrongDistantResyncAnchor(
+        sourceTokens: [SourceToken],
+        spokenTokens: [String]
+    ) -> Bool {
+        let stats = resyncStats(sourceTokens: sourceTokens, spokenTokens: spokenTokens)
+        return stats.matchCount >= minDistantResyncTailTokens
+            && stats.exactCount >= 5
+            && stats.distinctiveCount >= 3
+    }
+
+    private static func isStrongResyncAnchor(sourceTokens: [SourceToken], spokenTokens: [String]) -> Bool {
+        let stats = resyncStats(sourceTokens: sourceTokens, spokenTokens: spokenTokens)
+
+        if stats.matchCount >= 4 {
+            return stats.exactCount >= 2 || stats.distinctiveCount >= 1
+        }
+
+        if stats.matchCount == 3 {
+            let allUsefulWords = sourceTokens.allSatisfy { $0.value.count >= 3 }
+            return stats.exactCount >= 2 && (stats.distinctiveCount >= 1 || allUsefulWords)
+        }
+
+        if stats.matchCount == 2 {
+            return stats.distinctiveCount == 2 && stats.exactCount >= 1
+        }
+
+        return false
+    }
+
+    private static func resyncStats(
+        sourceTokens: [SourceToken],
+        spokenTokens: [String]
+    ) -> (matchCount: Int, exactCount: Int, distinctiveCount: Int) {
+        let exactCount = zip(sourceTokens, spokenTokens).filter { sourceToken, spokenToken in
+            sourceToken.value == spokenToken
+        }.count
+        let distinctiveCount = sourceTokens.filter { $0.value.count >= 5 }.count
+        return (sourceTokens.count, exactCount, distinctiveCount)
+    }
+
+    private static func isStrictMatch(_ source: String, _ spoken: String) -> Bool {
+        if source.isEmpty || spoken.isEmpty { return false }
+        if source == spoken { return true }
+
+        let shorter = min(source.count, spoken.count)
+        let longer = max(source.count, spoken.count)
+        guard shorter >= 4 else { return false }
+
+        let sourceChars = Array(source)
+        let spokenChars = Array(spoken)
+        guard sourceChars.first == spokenChars.first else { return false }
+
+        let distance = editDistance(source, spoken)
+        if shorter <= 7 {
+            return longer - shorter <= 1 && distance <= 1
+        }
+
+        guard sourceChars.dropFirst().first == spokenChars.dropFirst().first else {
+            return false
+        }
+        return longer - shorter <= 2 && distance <= 2
+    }
+
+    private static func sourceTokens(in text: String) -> [SourceToken] {
+        let words = text.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        var tokens: [SourceToken] = []
+        var wordOffset = 0
+
+        for word in words {
+            defer { wordOffset += word.count + 1 }
+            guard !isAnnotationWord(word) else { continue }
+
+            let ranges = tokenRanges(in: word)
+            for (index, range) in ranges.enumerated() {
+                let isLastTokenInWord = index == ranges.count - 1
+                let wordEnd = wordOffset + word.count
+                let advanceOffset = isLastTokenInWord
+                    ? min(wordEnd + 1, text.count)
+                    : wordOffset + range.end
+
+                tokens.append(SourceToken(
+                    value: range.value,
+                    advanceOffset: advanceOffset
+                ))
             }
         }
 
-        // Auto-skip trailing annotation words at end of source
-        while si < sourceWords.count && Self.isAnnotationWord(sourceWords[si]) {
-            matchedCharCount += sourceWords[si].count
-            if si < sourceWords.count - 1 { matchedCharCount += 1 }
-            si += 1
+        return tokens
+    }
+
+    private static func tokenValues(in text: String) -> [String] {
+        tokenRanges(in: text).map(\.value)
+    }
+
+    private static func tokenRanges(in text: String) -> [(value: String, start: Int, end: Int)] {
+        var ranges: [(value: String, start: Int, end: Int)] = []
+        var buffer = ""
+        var tokenStart: Int?
+        var charOffset = 0
+
+        func flush(at end: Int) {
+            guard let start = tokenStart, !buffer.isEmpty else { return }
+            ranges.append((value: buffer, start: start, end: end))
+            buffer = ""
+            tokenStart = nil
         }
 
-        return matchedCharCount
+        for character in text {
+            let normalized = normalizeToken(String(character))
+            if normalized.isEmpty {
+                flush(at: charOffset)
+            } else {
+                if tokenStart == nil {
+                    tokenStart = charOffset
+                }
+                buffer += normalized
+            }
+            charOffset += 1
+        }
+
+        flush(at: charOffset)
+        return ranges
     }
 
-    private func isFuzzyMatch(_ a: String, _ b: String) -> Bool {
-        if a.isEmpty || b.isEmpty { return false }
-        // Exact match
-        if a == b { return true }
-        // One starts with the other (phonetic prefix: "not" ~ "notch")
-        if a.hasPrefix(b) || b.hasPrefix(a) { return true }
-        // One contains the other
-        if a.contains(b) || b.contains(a) { return true }
-        // Shared prefix >= 60% of shorter word
-        let shared = zip(a, b).prefix(while: { $0 == $1 }).count
-        let shorter = min(a.count, b.count)
-        if shorter >= 2 && shared >= max(2, shorter * 3 / 5) { return true }
-        // Edit distance tolerance
-        let dist = editDistance(a, b)
-        if shorter <= 4 { return dist <= 1 }
-        if shorter <= 8 { return dist <= 2 }
-        return dist <= max(a.count, b.count) / 3
+    private static func normalizeToken(_ text: String) -> String {
+        text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: NotchSettings.shared.speechLocale))
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
     }
 
-    private func editDistance(_ a: String, _ b: String) -> Int {
+    private static func editDistance(_ a: String, _ b: String) -> Int {
         let a = Array(a), b = Array(b)
         var dp = Array(0...b.count)
         for i in 1...a.count {

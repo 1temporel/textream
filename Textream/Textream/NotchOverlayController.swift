@@ -396,7 +396,7 @@ class NotchOverlayController: NSObject {
         removeEscMonitor()
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            if event.keyCode == 53 { // ESC
+            if event.keyCode == NotchSettings.shared.stopShortcut.keyCode {
                 if self.overlayContent.showPagePicker {
                     self.overlayContent.showPagePicker = false
                     return nil
@@ -466,6 +466,22 @@ class NotchOverlayController: NSObject {
 
     var isShowing: Bool {
         panel != nil
+    }
+
+    var isVisible: Bool {
+        panel?.isVisible == true
+    }
+
+    func toggleVisibility() {
+        guard let panel else { return }
+
+        if panel.isVisible {
+            panel.orderOut(nil)
+            stopButtonPanel?.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+            stopButtonPanel?.orderFrontRegardless()
+        }
     }
 
     // MARK: - Floating Stop Button

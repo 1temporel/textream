@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Carbon
 
 extension Notification.Name {
     static let openSettings = Notification.Name("openSettings")
@@ -13,6 +14,11 @@ extension Notification.Name {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var localToggleMonitor: Any?
+    private var shortcutObserver: NSObjectProtocol?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandlerRef: EventHandlerRef?
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         let launchedByURL: Bool
@@ -53,7 +59,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 window.collectionBehavior.insert(.fullScreenNone)
             }
             self.removeUnwantedMenus()
+            self.installToggleShortcutMonitor()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        removeToggleShortcutMonitor()
     }
 
     private func removeUnwantedMenus() {
@@ -110,6 +121,109 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
     }
+
+    private func installToggleShortcutMonitor() {
+        removeToggleShortcutMonitor()
+
+        installSystemHotKey()
+
+        localToggleMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            if NotchSettings.shared.appToggleShortcut.matches(event) {
+                self.toggleTextreamVisibility()
+                return nil
+            }
+            return event
+        }
+
+        shortcutObserver = NotificationCenter.default.addObserver(
+            forName: AppToggleShortcut.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.installToggleShortcutMonitor()
+        }
+    }
+
+    private func removeToggleShortcutMonitor() {
+        if let localToggleMonitor {
+            NSEvent.removeMonitor(localToggleMonitor)
+        }
+        if let shortcutObserver {
+            NotificationCenter.default.removeObserver(shortcutObserver)
+        }
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+        }
+        if let hotKeyHandlerRef {
+            RemoveEventHandler(hotKeyHandlerRef)
+        }
+        localToggleMonitor = nil
+        shortcutObserver = nil
+        hotKeyRef = nil
+        hotKeyHandlerRef = nil
+    }
+
+    private func installSystemHotKey() {
+        let shortcut = NotchSettings.shared.appToggleShortcut
+
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+
+        let callback: EventHandlerUPP = { _, _, userData in
+            guard let userData else { return noErr }
+            let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async {
+                appDelegate.toggleTextreamVisibility()
+            }
+            return noErr
+        }
+
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            callback,
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &hotKeyHandlerRef
+        )
+
+        var hotKeyID = EventHotKeyID(signature: OSType(0x54585452), id: 1) // TXTR
+        let status = RegisterEventHotKey(
+            UInt32(shortcut.keyCode),
+            shortcut.carbonModifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+
+        if status != noErr {
+            print("Could not register global shortcut \(shortcut.label): \(status)")
+        }
+    }
+
+    func toggleTextreamVisibility() {
+        if TextreamService.shared.togglePrompterVisibility() {
+            return
+        }
+
+        let mainWindows = NSApp.windows.filter { !($0 is NSPanel) }
+        let hasVisibleMainWindow = mainWindows.contains { $0.isVisible }
+
+        if NSApp.isHidden || !hasVisibleMainWindow {
+            NSApp.unhide(nil)
+            NSApp.setActivationPolicy(.regular)
+            if let window = mainWindows.first {
+                window.makeKeyAndOrderFront(nil)
+            }
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            NSApp.hide(nil)
+        }
+    }
 }
 
 @main
@@ -146,6 +260,20 @@ struct TextreamApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
+            CommandGroup(replacing: .appVisibility) {
+                Button("Toggle Prompter Visibility") {
+                    (NSApp.delegate as? AppDelegate)?.toggleTextreamVisibility()
+                }
+
+                Button("Hide Others") {
+                    NSApp.hideOtherApplications(nil)
+                }
+                .keyboardShortcut("h", modifiers: [.command, .option])
+
+                Button("Show All") {
+                    NSApp.unhideAllApplications(nil)
+                }
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open File or Presentation…") {
                     TextreamService.shared.openFile()
@@ -167,7 +295,7 @@ struct TextreamApp: App {
             CommandGroup(replacing: .windowArrangement) { }
             CommandGroup(replacing: .help) {
                 Button("Textream Help") {
-                    if let url = URL(string: "https://github.com/f/textream") {
+                    if let url = URL(string: "https://github.com/1temporel/textream") {
                         NSWorkspace.shared.open(url)
                     }
                 }

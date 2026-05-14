@@ -30,7 +30,7 @@ Paste your script, hit play, and start speaking. When you're done, the overlay c
 
 ## Download
 
-**[Download the latest .dmg from Releases](https://github.com/f/textream/releases/latest)**
+**[Download the latest .dmg from Releases](https://github.com/1temporel/textream/releases/latest)**
 
 Or install with Homebrew:
 
@@ -178,7 +178,7 @@ Let someone else control your teleprompter remotely. A director can write, edit,
 ### Build
 
 ```bash
-git clone https://github.com/f/textream.git
+git clone https://github.com/1temporel/textream.git
 cd textream/Textream
 open Textream.xcodeproj
 ```

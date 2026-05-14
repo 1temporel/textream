@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Carbon
 
 // MARK: - Font Size Preset
 
@@ -184,7 +185,7 @@ enum OverlayMode: String, CaseIterable, Identifiable {
         switch self {
         case .pinned:     return "Anchored below the notch at the top of your screen."
         case .floating:   return "A draggable window you can place anywhere. Always on top."
-        case .fullscreen: return "Fullscreen teleprompter on the selected display. Press Esc to stop."
+        case .fullscreen: return "Fullscreen teleprompter on the selected display."
         }
     }
 
@@ -193,6 +194,147 @@ enum OverlayMode: String, CaseIterable, Identifiable {
         case .pinned:     return "rectangle.topthird.inset.filled"
         case .floating:   return "macwindow.on.rectangle"
         case .fullscreen: return "rectangle.fill"
+        }
+    }
+}
+
+// MARK: - Stop Shortcut
+
+enum StopShortcut: String, CaseIterable, Identifiable {
+    case escape, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .escape: return "Esc"
+        case .f1: return "F1"
+        case .f2: return "F2"
+        case .f3: return "F3"
+        case .f4: return "F4"
+        case .f5: return "F5"
+        case .f6: return "F6"
+        case .f7: return "F7"
+        case .f8: return "F8"
+        case .f9: return "F9"
+        case .f10: return "F10"
+        case .f11: return "F11"
+        case .f12: return "F12"
+        }
+    }
+
+    var keyCode: UInt16 {
+        switch self {
+        case .escape: return 53
+        case .f1: return 122
+        case .f2: return 120
+        case .f3: return 99
+        case .f4: return 118
+        case .f5: return 96
+        case .f6: return 97
+        case .f7: return 98
+        case .f8: return 100
+        case .f9: return 101
+        case .f10: return 109
+        case .f11: return 103
+        case .f12: return 111
+        }
+    }
+}
+
+// MARK: - App Toggle Shortcut
+
+struct AppToggleShortcut: Equatable {
+    static let changedNotification = Notification.Name("appToggleShortcutChanged")
+    static let modifierMask: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+
+    let keyCode: UInt16
+    let modifiers: NSEvent.ModifierFlags
+    let characters: String
+
+    static let defaultShortcut = AppToggleShortcut(keyCode: 4, modifiers: .command, characters: "h")
+
+    var storageValue: String {
+        "\(keyCode)|\(modifiers.rawValue)|\(characters)"
+    }
+
+    var label: String {
+        let modifierLabel = [
+            modifiers.contains(.command) ? "Cmd" : nil,
+            modifiers.contains(.option) ? "Opt" : nil,
+            modifiers.contains(.control) ? "Ctrl" : nil,
+            modifiers.contains(.shift) ? "Shift" : nil
+        ]
+        .compactMap { $0 }
+        .joined(separator: " ")
+
+        let keyLabel = Self.keyLabel(for: keyCode, characters: characters)
+        return modifierLabel.isEmpty ? keyLabel : "\(modifierLabel) \(keyLabel)"
+    }
+
+    var carbonModifiers: UInt32 {
+        var result: UInt32 = 0
+        if modifiers.contains(.command) { result |= UInt32(cmdKey) }
+        if modifiers.contains(.option) { result |= UInt32(optionKey) }
+        if modifiers.contains(.control) { result |= UInt32(controlKey) }
+        if modifiers.contains(.shift) { result |= UInt32(shiftKey) }
+        return result
+    }
+
+    func matches(_ event: NSEvent) -> Bool {
+        event.keyCode == keyCode &&
+        event.modifierFlags.intersection(Self.modifierMask) == modifiers
+    }
+
+    static func from(event: NSEvent) -> AppToggleShortcut? {
+        let modifiers = event.modifierFlags.intersection(modifierMask)
+        let characters = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        guard !characters.isEmpty || keyLabel(for: event.keyCode, characters: "").isEmpty == false else {
+            return nil
+        }
+        return AppToggleShortcut(keyCode: event.keyCode, modifiers: modifiers, characters: characters)
+    }
+
+    static func fromStorage(_ value: String?) -> AppToggleShortcut {
+        guard let value else { return defaultShortcut }
+        let parts = value.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count >= 3,
+              let keyCode = UInt16(parts[0]),
+              let rawModifiers = UInt(parts[1]) else {
+            return defaultShortcut
+        }
+        return AppToggleShortcut(
+            keyCode: keyCode,
+            modifiers: NSEvent.ModifierFlags(rawValue: rawModifiers),
+            characters: String(parts[2])
+        )
+    }
+
+    static func keyLabel(for keyCode: UInt16, characters: String) -> String {
+        switch keyCode {
+        case 36: return "Return"
+        case 48: return "Tab"
+        case 49: return "Space"
+        case 51: return "Delete"
+        case 53: return "Esc"
+        case 96: return "F5"
+        case 97: return "F6"
+        case 98: return "F7"
+        case 99: return "F3"
+        case 100: return "F8"
+        case 101: return "F9"
+        case 103: return "F11"
+        case 109: return "F10"
+        case 111: return "F12"
+        case 118: return "F4"
+        case 120: return "F2"
+        case 122: return "F1"
+        case 123: return "Left"
+        case 124: return "Right"
+        case 125: return "Down"
+        case 126: return "Up"
+        default:
+            return characters.uppercased()
         }
     }
 }
@@ -411,6 +553,17 @@ class NotchSettings {
         didSet { UserDefaults.standard.set(showElapsedTime, forKey: "showElapsedTime") }
     }
 
+    var stopShortcut: StopShortcut {
+        didSet { UserDefaults.standard.set(stopShortcut.rawValue, forKey: "stopShortcut") }
+    }
+
+    var appToggleShortcut: AppToggleShortcut {
+        didSet {
+            UserDefaults.standard.set(appToggleShortcut.storageValue, forKey: "appToggleShortcut")
+            NotificationCenter.default.post(name: AppToggleShortcut.changedNotification, object: nil)
+        }
+    }
+
     var selectedMicUID: String {
         didSet { UserDefaults.standard.set(selectedMicUID, forKey: "selectedMicUID") }
     }
@@ -493,6 +646,8 @@ class NotchSettings {
         self.scrollSpeed = savedSpeed > 0 ? savedSpeed : 3
         self.hideFromScreenShare = UserDefaults.standard.object(forKey: "hideFromScreenShare") as? Bool ?? true
         self.showElapsedTime = UserDefaults.standard.object(forKey: "showElapsedTime") as? Bool ?? true
+        self.stopShortcut = StopShortcut(rawValue: UserDefaults.standard.string(forKey: "stopShortcut") ?? "") ?? .escape
+        self.appToggleShortcut = AppToggleShortcut.fromStorage(UserDefaults.standard.string(forKey: "appToggleShortcut"))
         self.selectedMicUID = UserDefaults.standard.string(forKey: "selectedMicUID") ?? ""
         self.autoNextPage = UserDefaults.standard.object(forKey: "autoNextPage") as? Bool ?? false
         let savedDelay = UserDefaults.standard.integer(forKey: "autoNextPageDelay")

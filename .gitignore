@@ -3,6 +3,7 @@ build/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
+Textream/Textream.xcodeproj/xcuserdata/tanguycauvin.xcuserdatad/
 *.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 Textream/Textream.xcodeproj/project.xcworkspace/xcuserdata/
 

@@ -39,7 +39,7 @@ Textream includes two optional network servers that bind to your **local network
 
 | Server | Default Port | Purpose |
 |--------|-------------|---------|
-| **Remote Connection** (BrowserServer) | `8080` | Read-only teleprompter mirror for a browser |
+| **Remote Connection** (BrowserServer) | `7373` / `7374` | Read-only teleprompter mirror for a browser |
 | **Director Mode** (DirectorServer) | `7575` / `7576` | Remote script editing via HTTP + WebSocket |
 
 **Important:**
